@@ -1,0 +1,192 @@
+import type { ProvisioningProvider, CreateDbInstanceArgs, DbInstanceState, ModifyDbInstanceArgs } from './provider'
+import type { DbAuth } from './tenant-admin-pool'
+
+// In-memory stub: exercises the FULL state machine (including the async
+// "wait until available" polling) with zero real AWS. Swap for the real
+// @aws-sdk provider one method at a time, each verified against a test RDS.
+export class StubProvisioningProvider implements ProvisioningProvider {
+  // instanceId -> ticks remaining before it reports 'available' (simulates the ~5-10 min wait)
+  private pending = new Map<string, number>()
+  private endpoints = new Map<string, string>()
+  private stopped = new Set<string>()
+  private buckets = new Set<string>()
+  private paramGroups = new Set<string>()
+  private backups = new Map<string, Buffer>() // endpoint -> last dumped archive
+  private restored = new Map<string, Buffer>() // endpoint -> last restored archive
+  private dns = new Set<string>() // tenant hostnames pointed at the app
+  private instances = new Map<string, string>() // instanceId -> public IP (EC2 app instances)
+  private instanceSeq = 0
+  // How many getDbEndpoint polls before "available" (small so tests are fast).
+  constructor(private availableAfterPolls = 2) {}
+
+  async ensureParamGroup(paramGroup: string, _maxConnections: number): Promise<void> {
+    this.paramGroups.add(paramGroup) // idempotent
+  }
+
+  readonly shapes = new Map<string, DbInstanceState>()
+
+  async createDbInstance(args: CreateDbInstanceArgs): Promise<{ dbInstanceId: string; instanceClass?: string }> {
+    if (!this.endpoints.has(args.dbInstanceId) && !this.pending.has(args.dbInstanceId)) {
+      this.pending.set(args.dbInstanceId, this.availableAfterPolls)
+      this.shapes.set(args.dbInstanceId, {
+        status: 'available',
+        instanceClass: args.instanceClass ?? 'db.t4g.micro',
+        storageGb: args.storageGb ?? 20,
+        multiAz: !!args.multiAz,
+        pending: false,
+      })
+    }
+    return { dbInstanceId: args.dbInstanceId }
+  }
+
+  async describeDbInstance(dbInstanceId: string): Promise<DbInstanceState | null> {
+    return this.shapes.get(dbInstanceId) ?? null
+  }
+
+  // Applied at once whatever the mode (the stub has no maintenance window).
+  async modifyDbInstance(dbInstanceId: string, args: ModifyDbInstanceArgs): Promise<void> {
+    const s = this.shapes.get(dbInstanceId)
+    if (!s) throw new Error(`DBInstanceNotFound: ${dbInstanceId}`)
+    this.shapes.set(dbInstanceId, {
+      ...s,
+      ...(args.instanceClass ? { instanceClass: args.instanceClass } : {}),
+      ...(args.storageGb ? { storageGb: args.storageGb } : {}),
+      ...(args.multiAz != null ? { multiAz: args.multiAz } : {}),
+    })
+  }
+
+  async getDbEndpoint(dbInstanceId: string): Promise<string | null> {
+    if (this.endpoints.has(dbInstanceId)) return this.endpoints.get(dbInstanceId)!
+    const left = this.pending.get(dbInstanceId)
+    if (left === undefined) return null
+    if (left <= 0) {
+      const ep = `${dbInstanceId}.stub.us-east-1.rds.amazonaws.com`
+      this.endpoints.set(dbInstanceId, ep)
+      this.pending.delete(dbInstanceId)
+      return ep
+    }
+    this.pending.set(dbInstanceId, left - 1)
+    return null // still provisioning
+  }
+
+  // No database exists behind a stub endpoint, an on-node one included: nothing to load.
+  async loadSchema(_endpoint: string, _dbName: string, _appUser?: string, _db?: DbAuth): Promise<void> {
+    /* no-op in stub */
+  }
+
+  readonly databases = new Set<string>() // endpoint/db for Starter stores on a shared host
+
+  async initSharedDbHost(_endpoint: string): Promise<void> {
+    /* no-op in stub */
+  }
+
+  async createTenantDatabase(endpoint: string, dbName: string, _role: string): Promise<void> {
+    this.databases.add(`${endpoint}/${dbName}`)
+  }
+
+  async dropTenantDatabase(endpoint: string, dbName: string, _role: string | null): Promise<void> {
+    this.databases.delete(`${endpoint}/${dbName}`)
+  }
+
+  async backupDb(endpoint: string, _dbName: string, _db?: DbAuth): Promise<Buffer> {
+    // Deterministic fake archive so callers get real bytes to round-trip through S3.
+    const buf = Buffer.from(JSON.stringify({ stub: true, endpoint }), 'utf8')
+    this.backups.set(endpoint, buf)
+    return buf
+  }
+
+  async restoreDb(endpoint: string, _dbName: string, archive: Buffer, _db?: DbAuth): Promise<void> {
+    this.restored.set(endpoint, archive)
+  }
+
+  async ensureBucket(bucket: string): Promise<void> {
+    this.buckets.add(bucket)
+  }
+  /** destPrefix → source bucket, for tests. */
+  archivedBuckets = new Map<string, string>()
+  restoredBuckets = new Map<string, string>()
+  async archiveBucket(bucket: string, destPrefix: string): Promise<{ objects: number; bytes: number }> {
+    this.archivedBuckets.set(destPrefix, bucket)
+    return { objects: 0, bytes: 0 }
+  }
+  async restoreBucket(srcPrefix: string, bucket: string): Promise<{ objects: number }> {
+    this.restoredBuckets.set(bucket, srcPrefix)
+    return { objects: 0 }
+  }
+  async readSiteSettings(_endpoint: string, _dbName: string, _db?: DbAuth): Promise<Record<string, string>> {
+    return {}
+  }
+
+  async ensureDns(hostnames: string[], _targetIp?: string): Promise<void> {
+    hostnames.forEach(h => this.dns.add(h))
+  }
+  async removeDns(hostnames: string[]): Promise<void> {
+    hostnames.forEach(h => this.dns.delete(h))
+  }
+
+  async stopDbInstance(dbInstanceId: string): Promise<void> {
+    this.stopped.add(dbInstanceId)
+  }
+  async startDbInstance(dbInstanceId: string): Promise<void> {
+    this.stopped.delete(dbInstanceId)
+  }
+
+  async deleteDbInstance(dbInstanceId: string): Promise<void> {
+    this.endpoints.delete(dbInstanceId)
+    this.pending.delete(dbInstanceId)
+    this.stopped.delete(dbInstanceId)
+  }
+  async deleteBucket(bucket: string): Promise<void> {
+    this.buckets.delete(bucket)
+  }
+
+  async isDbInstanceGone(dbInstanceId: string): Promise<boolean> {
+    return !this.endpoints.has(dbInstanceId) && !this.pending.has(dbInstanceId)
+  }
+  async deleteParamGroup(paramGroup: string): Promise<void> {
+    this.paramGroups.delete(paramGroup)
+  }
+
+  async ensureAppInstance(
+    args: { name: string; instanceType: string; userData?: string },
+    onLaunched?: (instanceId: string) => Promise<void>
+  ): Promise<{ instanceId: string; ip: string }> {
+    const instanceId = `i-stub${String(++this.instanceSeq).padStart(6, '0')}`
+    const ip = `52.0.0.${this.instanceSeq}`
+    this.instances.set(instanceId, ip)
+    if (onLaunched) await onLaunched(instanceId)
+    return { instanceId, ip }
+  }
+  async deleteAppInstance(instanceId: string): Promise<void> {
+    this.instances.delete(instanceId)
+  }
+  async isInstanceGone(instanceId: string): Promise<boolean> {
+    return !this.instances.has(instanceId)
+  }
+
+  // test helpers
+  isStopped(id: string) {
+    return this.stopped.has(id)
+  }
+  hasBucket(b: string) {
+    return this.buckets.has(b)
+  }
+  hasParamGroup(pg: string) {
+    return this.paramGroups.has(pg)
+  }
+  wasBackedUp(endpoint: string) {
+    return this.backups.has(endpoint)
+  }
+  wasRestored(endpoint: string) {
+    return this.restored.has(endpoint)
+  }
+  hasDns(host: string) {
+    return this.dns.has(host)
+  }
+  hasInstance(id: string) {
+    return this.instances.has(id)
+  }
+  instanceCount() {
+    return this.instances.size
+  }
+}

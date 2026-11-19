@@ -1,0 +1,267 @@
+'use client'
+
+import { useEffect, useState, useCallback } from 'react'
+import CertsLoading from './CertsLoading'
+
+interface Cert {
+  serial: string
+  commonName: string
+  role: string | null
+  storeName: string | null
+  /** The admin panel the certificate opens, e.g. admin-<slug>.jeffistores.in or admin.<store domain>. */
+  adminHost: string | null
+  expiresAt: string
+  downloadedAt: string | null
+  status: 'available' | 'downloaded' | 'revoked' | 'expired'
+  needsMobile?: boolean
+  mobileHint?: string | null
+}
+
+const STATUS_STYLE: Record<string, string> = {
+  available: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300',
+  downloaded: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+  revoked: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  expired: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+}
+const STATUS_LABEL: Record<string, string> = {
+  available: 'Available',
+  downloaded: 'Downloaded',
+  revoked: 'Revoked',
+  expired: 'Expired',
+}
+
+export default function CertList() {
+  const [certs, setCerts] = useState<Cert[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+  const [password, setPassword] = useState<{ serial: string; value: string } | null>(null)
+
+  const load = useCallback(() => {
+    fetch('/api/certportal/certs', { credentials: 'include' })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error('Please sign in again.'))))
+      .then(d => setCerts(Array.isArray(d.certs) ? d.certs : []))
+      .catch(e => setError(e.message))
+  }, [])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  async function download(serial: string, cn: string) {
+    setBusy(serial)
+    setError(null)
+    setPassword(null)
+    try {
+      const res = await fetch(`/api/certportal/certs/${encodeURIComponent(serial)}/download`, {
+        credentials: 'include',
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || 'Download failed')
+      }
+      const pwd = res.headers.get('X-Cert-Password') || ''
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${cn.replace(/[^a-zA-Z0-9._@-]/g, '_')}.p12`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      if (pwd) setPassword({ serial, value: pwd })
+      load()
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  if (error && !certs) return <p className="mt-6 text-sm text-red-600 dark:text-red-400">{error}</p>
+  if (!certs) return <CertsLoading />
+  if (certs.length === 0) {
+    return (
+      <p className="mt-6 text-sm text-foreground-secondary">
+        No certificates are associated with this Google account. If you were invited, make sure you signed in with the
+        exact email the invitation was sent to.
+      </p>
+    )
+  }
+
+  return (
+    <div className="mt-6 grid items-start gap-4 lg:grid-cols-2">
+      {error && <p className="text-sm text-red-600 dark:text-red-400 lg:col-span-2">{error}</p>}
+      {certs.map(c => (
+        <div key={c.serial} className="rounded-lg border border-border-default bg-surface-elevated p-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-medium text-foreground">{c.storeName || 'Jeffi Stores'}</p>
+              {c.adminHost && (
+                <p className="text-sm break-all">
+                  <span className="text-foreground-muted">Admin panel: </span>
+                  <a
+                    href={`https://${c.adminHost}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-medium text-accent-600 dark:text-accent-400 hover:underline"
+                  >
+                    {c.adminHost}
+                  </a>
+                </p>
+              )}
+              <p className="text-sm text-foreground-secondary">
+                {c.commonName}
+                {c.role ? ` · ${c.role}` : ''}
+              </p>
+              <p className="text-xs text-foreground-muted mt-1">
+                Expires{' '}
+                {new Date(c.expiresAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                {c.downloadedAt
+                  ? ` · downloaded ${new Date(c.downloadedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`
+                  : ''}
+              </p>
+            </div>
+            <span
+              className={`px-2.5 py-0.5 rounded-full text-xs font-semibold whitespace-nowrap ${STATUS_STYLE[c.status]}`}
+            >
+              {STATUS_LABEL[c.status]}
+            </span>
+          </div>
+
+          {c.status === 'available' && c.needsMobile && <MobileStep serial={c.serial} onVerified={load} />}
+
+          {c.status === 'available' && !c.needsMobile && (
+            <button
+              onClick={() => download(c.serial, c.commonName)}
+              disabled={busy === c.serial}
+              className="mt-3 w-full px-4 py-2 bg-accent-600 hover:bg-accent-700 text-white rounded-lg font-semibold text-sm transition-colors disabled:opacity-50"
+            >
+              {busy === c.serial ? 'Downloading…' : 'Download certificate (once)'}
+            </button>
+          )}
+
+          {password?.serial === c.serial && (
+            <div className="mt-3 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 p-3">
+              <p className="text-sm font-medium text-amber-900 dark:text-amber-200">Import password</p>
+              <p className="mt-1 font-mono text-sm text-foreground break-all select-all">{password.value}</p>
+              <p className="mt-1 text-xs text-amber-800 dark:text-amber-300">
+                You will need this password when installing the certificate. It is shown only now — copy it before
+                leaving this page.
+              </p>
+            </div>
+          )}
+        </div>
+      ))}
+
+      <InstallHelp />
+    </div>
+  )
+}
+
+// Before the first download: the admin's mobile number, confirmed with a code sent on WhatsApp or SMS.
+function MobileStep({ serial, onVerified }: { serial: string; onVerified: () => void }) {
+  const [phone, setPhone] = useState('')
+  const [otp, setOtp] = useState('')
+  const [sentBy, setSentBy] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function call(path: string, body: object) {
+    setBusy(true)
+    setError(null)
+    const res = await fetch(`/api/certportal/mobile/${path}`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => null)
+    const data = await res?.json().catch(() => ({}))
+    setBusy(false)
+    if (!res?.ok) setError(data?.error || 'Something went wrong. Try again.')
+    return res?.ok ? data : null
+  }
+
+  const input = 'w-full px-3 py-2 rounded-lg border border-border-secondary bg-surface text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent-500'
+  const button = 'px-4 py-2 bg-accent-600 hover:bg-accent-700 text-white rounded-lg font-semibold text-sm transition-colors disabled:opacity-50 whitespace-nowrap'
+  return (
+    <div className="mt-3 rounded-lg border border-border-default bg-surface p-3 space-y-2">
+      <p className="text-sm font-medium text-foreground">Verify your mobile number to download</p>
+      <p className="text-xs text-foreground-muted">
+        We send a code on WhatsApp, or by SMS. The admin assistant can also answer you on this number.
+      </p>
+      <div className="flex gap-2">
+        <input className={input} type="tel" inputMode="tel" autoComplete="tel" placeholder="+91 98765 43210" value={phone} onChange={e => setPhone(e.target.value)} disabled={busy} />
+        <button
+          type="button"
+          className={button}
+          disabled={busy || phone.replace(/\D/g, '').length < 10}
+          onClick={async () => {
+            const d = await call('send', { serial, phone })
+            if (d) setSentBy(d.channel === 'whatsapp' ? 'WhatsApp' : 'SMS')
+          }}
+        >
+          {sentBy ? 'Send again' : 'Send code'}
+        </button>
+      </div>
+      {sentBy && (
+        <>
+          <p className="text-xs text-foreground-secondary">Code sent on {sentBy}. It is valid for 10 minutes.</p>
+          <div className="flex gap-2">
+            <input className={input} inputMode="numeric" autoComplete="one-time-code" maxLength={6} placeholder="6-digit code" value={otp} onChange={e => setOtp(e.target.value.replace(/\D/g, ''))} disabled={busy} />
+            <button
+              type="button"
+              className={button}
+              disabled={busy || otp.length !== 6}
+              onClick={async () => {
+                if (await call('verify', { serial, otp })) onVerified()
+              }}
+            >
+              Verify
+            </button>
+          </div>
+        </>
+      )}
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+    </div>
+  )
+}
+
+function InstallHelp() {
+  return (
+    <details className="mt-2 rounded-lg border border-border-default bg-surface p-4 lg:col-span-2">
+      <summary className="cursor-pointer text-sm font-medium text-foreground">How to install the certificate</summary>
+      <div className="mt-3 space-y-3 text-sm text-foreground-secondary">
+        <div>
+          <p className="font-medium text-foreground">macOS (Keychain)</p>
+          <p>
+            Double-click the .p12, enter the import password, then set the certificate to &quot;Always Trust&quot; in
+            Keychain Access.
+          </p>
+        </div>
+        <div>
+          <p className="font-medium text-foreground">Windows</p>
+          <p>
+            Double-click the .p12 to open the Certificate Import Wizard, choose &quot;Current User&quot;, enter the
+            password, and let Windows select the store automatically.
+          </p>
+        </div>
+        <div>
+          <p className="font-medium text-foreground">Chrome / Linux</p>
+          <p>
+            Settings &gt; Privacy and security &gt; Security &gt; Manage certificates &gt; Your certificates &gt;
+            Import, then choose the .p12 and enter the password.
+          </p>
+        </div>
+        <div>
+          <p className="font-medium text-foreground">Certificate not working?</p>
+          <p>
+            Make sure you imported into the same browser/profile you use for the admin panel, restart the browser, and
+            confirm the certificate is not expired or revoked above. If it still fails, ask a super admin to re-issue
+            it.
+          </p>
+        </div>
+      </div>
+    </details>
+  )
+}

@@ -1,0 +1,74 @@
+import { NextResponse } from 'next/server'
+import twilio from 'twilio'
+import { debitMessageCost, refundMessageEstimate } from '@/lib/shared/messaging/billing'
+import { usdToInr } from '@/lib/shared/messaging/pricing'
+import { followsProviderPrice } from '@jeffi/pricing'
+import { loadMessagePricing } from '@/lib/billing/message-pricing'
+import { lookupTenantContextById } from '@/lib/tenant-registry/host-resolution'
+import { runWithTenantContext } from '@/lib/tenancy/tenant-context'
+import { getTenantSender, audiencesFor } from '@/lib/messaging/tenant-senders'
+import { applyDeliveryStatus } from '@controller/lib/shared/messaging/delivery-status'
+
+export const dynamic = 'force-dynamic'
+
+// Twilio delivery/price status callback. On a priced success the exact provider price (USD→INR) is
+// trued up on the wallet; on a terminal failure (failed / undelivered — Twilio sends Price=0 there,
+// so the old priceInr>0 branch never refunded) the send-time estimate is refunded except for the
+// non-refundable processing fee. Tenant id travels on ?t= (webhook has no Host).
+export async function POST(request: Request) {
+  const authToken = process.env.TWILIO_AUTH_TOKEN
+  if (!authToken) return NextResponse.json({ error: 'not configured' }, { status: 500 })
+
+  const form = await request.formData()
+  const params: Record<string, string> = {}
+  for (const [k, v] of form.entries()) params[k] = typeof v === 'string' ? v : String(v)
+
+  const tenantId = new URL(request.url).searchParams.get('t') || ''
+  const base = process.env.PUBLIC_WEBHOOK_BASE_URL || process.env.APP_URL || 'https://jeffistores.in'
+  const url = `${base.replace(/\/$/, '')}/api/webhooks/twilio/status?t=${encodeURIComponent(tenantId)}`
+  const sig = request.headers.get('x-twilio-signature') || ''
+  const channel = (params.From || params.To || '').startsWith('whatsapp:') ? 'whatsapp' : 'sms'
+  // A send from one of the store's own Twilio accounts (tenant_messaging_senders: its customer or admin number) is
+  // signed with that account's token.
+  const ownTokens = async () =>
+    (await Promise.all(audiencesFor(tenantId).map(a => getTenantSender(tenantId, channel, a).catch(() => null))))
+      .map(s => s?.config.auth_token)
+      .filter((t): t is string => !!t)
+  if (!twilio.validateRequest(authToken, sig, url, params)) {
+    const tokens = tenantId ? await ownTokens() : []
+    if (!tokens.some(t => twilio.validateRequest(t, sig, url, params))) return NextResponse.json({ error: 'invalid signature' }, { status: 403 })
+  }
+
+  const sid = params.MessageSid || params.SmsSid
+  const status = params.MessageStatus || params.SmsStatus || ''
+  const price = params.Price ? Number(params.Price) : 0
+  if (!sid || !tenantId) return new NextResponse(null, { status: 204 })
+
+  // The pricing sheet decides the USD rate and whether Twilio's reported price replaces the fixed one (Ecom → Configuration).
+  await loadMessagePricing()
+  const priceInr = price && followsProviderPrice(channel, 'twilio') ? usdToInr(price) : 0
+  const terminalFailure = status === 'failed' || status === 'undelivered'
+
+  try {
+    // Terminal failure: refund the estimate down to the processing fee; net wallet charge = fee.
+    // Success with a priced row: existing true-up to the exact provider price. Both are keyed on
+    // msg:<sid> so Twilio retries are idempotent.
+    let chargedInr: number | null = priceInr || null
+    if (terminalFailure) {
+      const { keptInr } = await refundMessageEstimate({ tenantId, sid, channel, status })
+      chargedInr = keptInr
+    } else if (priceInr > 0) {
+      await debitMessageCost({ tenantId, channel, providerSid: sid, priceInr })
+    }
+    const ctx = await lookupTenantContextById(tenantId)
+    if (ctx) {
+      await runWithTenantContext(ctx, () =>
+        applyDeliveryStatus({ providerSid: sid, status, provider: 'twilio', priceInr: chargedInr, error: params.ErrorMessage || (params.ErrorCode ? `Error ${params.ErrorCode}` : null) })
+      )
+    }
+    return new NextResponse(null, { status: 204 })
+  } catch {
+    // Let Twilio retry; the debit / refund is idempotent on msg:<sid>.
+    return NextResponse.json({ error: 'retry' }, { status: 503 })
+  }
+}

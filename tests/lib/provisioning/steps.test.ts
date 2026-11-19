@@ -1,0 +1,941 @@
+/**
+ * Tests for src/lib/provisioning/steps.ts — the tenant provisioning state machine.
+ *
+ * This is the file that creates and destroys REAL billable AWS infrastructure, so
+ * the behaviours pinned here are the ones whose failure costs money or breaks a
+ * live tenant:
+ *
+ *   - preflight fails BEFORE any billable resource when config is missing
+ *   - wait_db_available polls (stays 'pending') and is bounded by a deadline
+ *   - activate refuses to go live without a persisted rds_endpoint (otherwise
+ *     getPool silently falls back to the PLATFORM database — a cross-tenant leak)
+ *   - verify_serving proves the host actually answers before going live
+ *   - transient errors retry with backoff; terminal errors fail fast and roll back
+ *   - deprovision backs up BEFORE deleting, and takes the store offline first
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { StubProvisioningProvider } from '@controller/lib/provisioning/stub-provider'
+
+// ---------------------------------------------------------------------------
+// tenant-registry is the persistence seam — mock it entirely.
+// ---------------------------------------------------------------------------
+const reg = {
+  getTenant: vi.fn(),
+  getProvisioningJob: vi.fn(),
+  updateProvisioningJob: vi.fn().mockResolvedValue(undefined),
+  setTenantStatus: vi.fn().mockResolvedValue(undefined),
+  setStoreRequest: vi.fn().mockResolvedValue(undefined),
+  writeTenantInfra: vi.fn().mockResolvedValue(undefined),
+  writeTenantEc2: vi.fn().mockResolvedValue(undefined),
+  clearTenantInfra: vi.fn().mockResolvedValue(undefined),
+  clearTenantCache: vi.fn(),
+}
+vi.mock('@/lib/tenant-registry', () => reg)
+
+const backupStore = {
+  getTenantBackup: vi.fn(),
+  putTenantBackup: vi.fn(),
+  archiveMediaPrefix: vi.fn((ownerId: string, slug: string) => `tenant-backups/media/${ownerId}/${slug}/STAMP/`),
+  deleteTenantBackups: vi.fn().mockResolvedValue({ deleted: 0 }),
+}
+vi.mock('@/lib/tenancy/tenant-backup-store', () => backupStore)
+
+// What a deprovision kept for the owner (tenant_archives).
+const archives = {
+  createTenantArchive: vi.fn().mockResolvedValue({ id: 'arch-1' }),
+  getOwnerArchive: vi.fn(),
+  markArchiveRestored: vi.fn().mockResolvedValue(undefined),
+}
+vi.mock('@/lib/tenant-registry/archives', () => archives)
+
+const seedMod = { seedTenantData: vi.fn().mockResolvedValue(undefined), seedStudioCatalog: vi.fn() }
+vi.mock('@controller/lib/provisioning/seed', () => seedMod)
+
+const sharedDb = vi.hoisted(() => ({
+  reserveSharedDbHost: vi.fn(),
+  markSharedDbHostAvailable: vi.fn(),
+  releaseSharedDbSeat: vi.fn(),
+  tenantDbNames: (slug: string) => ({ db: `t_${slug}`, role: `app_${slug}` }),
+}))
+vi.mock('@controller/lib/compute/shared-db', () => sharedDb)
+
+// ---------------------------------------------------------------------------
+const TENANT = { id: 't-1', slug: 'acme', plan: 'basic', rds_endpoint: null, s3_bucket: null, rds_db: null }
+
+function job(over: Partial<any> = {}): any {
+  return {
+    id: 'job-1',
+    tenant_id: 't-1',
+    step: 'preflight',
+    status: 'pending',
+    attempts: 0,
+    last_error: null,
+    created_resources: {},
+    ...over,
+  }
+}
+
+/** Last patch passed to updateProvisioningJob. */
+function lastPatch() {
+  const calls = reg.updateProvisioningJob.mock.calls
+  return calls.length ? calls[calls.length - 1][1] : null
+}
+/** All patches, for asserting a step transition happened. */
+function patches() {
+  return reg.updateProvisioningJob.mock.calls.map((c: any[]) => c[1])
+}
+
+describe('provisioning state machine', () => {
+  let provider: StubProvisioningProvider
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    reg.getTenant.mockResolvedValue({ ...TENANT })
+    reg.getProvisioningJob.mockResolvedValue(null)
+    reg.updateProvisioningJob.mockResolvedValue(undefined)
+    reg.setTenantStatus.mockResolvedValue(undefined)
+    reg.writeTenantInfra.mockResolvedValue(undefined)
+    reg.clearTenantInfra.mockResolvedValue(undefined)
+    provider = new StubProvisioningProvider(0)
+    process.env.RDS_MASTER_PASSWORD = 'secret'
+    process.env.TENANT_APP_TARGET_IP = '203.0.113.10' // NOT the flagship — see flagship interlock
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    delete process.env.RDS_MASTER_PASSWORD
+    delete process.env.TENANT_APP_TARGET_IP
+  })
+
+  // -------------------------------------------------------------------------
+  describe('guard: tenant missing', () => {
+    it('fails the job when the tenant row is gone', async () => {
+      reg.getTenant.mockResolvedValue(null)
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job(), provider)).resolves.toBe('failed')
+      expect(lastPatch()).toMatchObject({ status: 'failed', last_error: 'tenant not found' })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('preflight — fails before ANY billable infra', () => {
+    it('fails terminally when RDS_MASTER_PASSWORD is missing', async () => {
+      delete process.env.RDS_MASTER_PASSWORD
+      reg.getTenant.mockResolvedValue({ ...TENANT, plan: 'growth' })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('failed')
+      expect(lastPatch().last_error ?? '').toMatch(/RDS_MASTER_PASSWORD/)
+    })
+
+    it('fails terminally when TENANT_APP_TARGET_IP is missing', async () => {
+      delete process.env.TENANT_APP_TARGET_IP
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('failed')
+      expect(lastPatch().last_error ?? '').toMatch(/TENANT_APP_TARGET_IP/)
+    })
+
+    it('reports BOTH missing vars in one error', async () => {
+      delete process.env.RDS_MASTER_PASSWORD
+      delete process.env.TENANT_APP_TARGET_IP
+      reg.getTenant.mockResolvedValue({ ...TENANT, plan: 'growth' })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'preflight' }), provider)
+      const err = lastPatch().last_error ?? ''
+      expect(err).toMatch(/RDS_MASTER_PASSWORD/)
+      expect(err).toMatch(/TENANT_APP_TARGET_IP/)
+    })
+
+    it('treats a blank TENANT_APP_TARGET_IP as missing', async () => {
+      process.env.TENANT_APP_TARGET_IP = '   '
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('failed')
+    })
+
+    it('pins the store pipeline and advances to its first database step when config is complete', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('pending')
+      // Basic runs Postgres on its own server, so no parameter group.
+      expect(patches().some(p => p.step === 'launch_server' && p.stepStarted)).toBe(true)
+      expect(patches().some(p => p.step === 'create_param_group')).toBe(false)
+      const pinned = patches().find(p => p.pipeline)?.pipeline
+      expect(pinned?.v).toBe(2)
+      // Stub provider: the owner certificate comes from the worker once the job is done, not a step.
+      expect(pinned.jobs.flatMap((j: any) => j.steps.map((s: any) => s.id))).not.toContain('issue_owner_certificate')
+    })
+
+    it('fails terminally when TENANT_APP_TARGET_IP is the flagship and no tenant compute is configured', async () => {
+      process.env.TENANT_APP_TARGET_IP = '52.20.193.62'
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('failed')
+      expect(lastPatch().last_error ?? '').toMatch(/flagship/i)
+      expect(patches().some(p => p.step === 'create_param_group')).toBe(false)
+    })
+
+    it('allows the flagship IP once tenant compute IS configured', async () => {
+      process.env.TENANT_APP_TARGET_IP = '52.20.193.62'
+      process.env.TENANT_APP_AMI_ID = 'ami-1'
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await expect(advanceProvisioningJob(job({ step: 'preflight' }), provider)).resolves.toBe('pending')
+      delete process.env.TENANT_APP_AMI_ID
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('infrastructure steps', () => {
+    // Presets now default to node-mode Postgres (db on the tenant's own node), so a default
+    // basic tenant SKIPS the RDS path. These tests specifically exercise the RDS path, so each
+    // pins an explicit DEDICATED (RDS) spec via created_resources.computeSpec — jobCompute reads
+    // res.computeSpec and resolveCompute honours it over the plan default.
+    const dedicatedRds = {
+      node: { placement: 'dedicated', type: 't4g.small', count: 1 },
+      db: { mode: 'dedicated', class: 'db.t4g.micro', storageGb: 20, multiAz: false },
+      services: {
+        storefront: { replicas: 1, maxReplicas: 1, size: 'S' },
+        admin: { replicas: 1, maxReplicas: 1, size: 'S' },
+        business: { replicas: 1, maxReplicas: 1, size: 'S' },
+        messaging: { replicas: 1, maxReplicas: 1, size: 'S' },
+        documents: { replicas: 1, maxReplicas: 1, size: 'S' },
+      },
+      storage: { s3Gb: 20 },
+    }
+
+    it('preflight routes a store with its own RDS to create_param_group', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'preflight', created_resources: { computeSpec: dedicatedRds } }), provider)
+      expect(patches().some(p => p.step === 'create_param_group')).toBe(true)
+    })
+
+    it('create_param_group creates the group and records it', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'create_param_group', created_resources: { computeSpec: dedicatedRds } }), provider)
+      expect(provider.hasParamGroup('jeffi-tenant-acme-pg16')).toBe(true)
+      const p = patches().find(x => x.step === 'create_db_instance')
+      expect(p?.created_resources).toMatchObject({ paramGroup: 'jeffi-tenant-acme-pg16' })
+    })
+
+    it('create_db_instance records the instance id and moves to the wait step', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'create_db_instance', created_resources: { computeSpec: dedicatedRds } }), provider)
+      const p = patches().find(x => x.step === 'wait_db_available')
+      expect(p?.created_resources).toMatchObject({ dbInstanceId: 'jeffi-tenant-acme' })
+    })
+
+    it('wait_db_available stays PENDING on the same step while RDS is still creating', async () => {
+      const slow = new StubProvisioningProvider(3)
+      await slow.createDbInstance({ dbInstanceId: 'jeffi-tenant-acme', paramGroup: 'pg', maxConnections: 50 })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(
+        job({ step: 'wait_db_available', created_resources: { dbInstanceId: 'jeffi-tenant-acme', computeSpec: dedicatedRds } }),
+        slow
+      )
+      expect(res).toBe('pending')
+      // stayed put — no step transition was written
+      expect(patches().every(p => p.step === undefined)).toBe(true)
+    })
+
+    it('wait_db_available advances once the endpoint appears', async () => {
+      await provider.createDbInstance({ dbInstanceId: 'jeffi-tenant-acme', paramGroup: 'pg', maxConnections: 50 })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(
+        job({ step: 'wait_db_available', created_resources: { dbInstanceId: 'jeffi-tenant-acme', computeSpec: dedicatedRds } }),
+        provider
+      )
+      const p = patches().find(x => x.step === 'load_schema')
+      expect(p?.created_resources?.endpoint).toContain('jeffi-tenant-acme')
+    })
+
+    it('wait_db_available FAILS once the 25-minute deadline is exceeded', async () => {
+      const never = new StubProvisioningProvider(999)
+      await never.createDbInstance({ dbInstanceId: 'jeffi-tenant-acme', paramGroup: 'pg', maxConnections: 50 })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const started = Date.now() - 26 * 60 * 1000 // started 26 min ago
+      const res = await advanceProvisioningJob(
+        job({
+          step: 'wait_db_available',
+          created_resources: { dbInstanceId: 'jeffi-tenant-acme', dbWaitStartedAt: started, computeSpec: dedicatedRds },
+        }),
+        never
+      )
+      // deadline breach throws -> retryable/terminal classification kicks in
+      expect(['failed', 'pending']).toContain(res)
+      expect(String(lastPatch().last_error ?? '')).toMatch(/did not become available/)
+    })
+
+    it('load_schema loads then advances to restore_data', async () => {
+      const spy = vi.spyOn(provider, 'loadSchema')
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'load_schema', created_resources: { endpoint: 'ep-1', computeSpec: dedicatedRds } }), provider)
+      expect(spy).toHaveBeenCalledWith('ep-1', 'jeffi_stores')
+      expect(patches().some(p => p.step === 'restore_data')).toBe(true)
+    })
+
+    it('create_bucket creates the tenant bucket', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'create_bucket' }), provider)
+      expect(provider.hasBucket('jeffi-tenant-acme')).toBe(true)
+    })
+
+    it('write_infra persists the endpoint + bucket pointers', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(
+        job({ step: 'write_infra', created_resources: { endpoint: 'ep-1', bucket: 'b-1', computeSpec: dedicatedRds } }),
+        provider
+      )
+      expect(reg.writeTenantInfra).toHaveBeenCalledWith('t-1', { rdsEndpoint: 'ep-1', s3Bucket: 'b-1' })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('Starter: a database of its own on a shared host', () => {
+    const shared = {
+      node: { placement: 'pool', type: null, count: 1 },
+      db: { mode: 'shared', class: null, storageGb: 10, multiAz: false },
+      services: {
+        controller: { replicas: 1, maxReplicas: 1, size: 'S' },
+        messaging: { replicas: 1, maxReplicas: 1, size: 'S' },
+        documents: { replicas: 1, maxReplicas: 1, size: 'S' },
+      },
+    }
+
+    it('takes a seat, creates the store database + login, and rollback drops only that database', async () => {
+      sharedDb.reserveSharedDbHost.mockResolvedValue({ id: 'jeffi-starter-1' })
+      sharedDb.markSharedDbHostAvailable.mockResolvedValue(undefined)
+      sharedDb.releaseSharedDbSeat.mockResolvedValue(undefined)
+      const { advanceProvisioningJob, rollbackProvisioning } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'create_db_instance', created_resources: { computeSpec: shared } }), provider)
+      const reserved = patches().find(x => x.step === 'wait_db_available')?.created_resources
+      expect(reserved).toMatchObject({ sharedDbHost: 'jeffi-starter-1' })
+      expect(reserved.dbInstanceId).toBeUndefined()
+
+      await provider.createDbInstance({ dbInstanceId: 'jeffi-starter-1', paramGroup: 'pg', maxConnections: 200 })
+      await advanceProvisioningJob(job({ step: 'wait_db_available', created_resources: reserved }), provider)
+      const ready = patches().find(x => x.step === 'load_schema')?.created_resources
+      expect(ready).toMatchObject({ dbName: 't_acme', rdsUser: 'app_acme' })
+      expect(provider.databases.has(`${ready.endpoint}/t_acme`)).toBe(true)
+
+      const del = vi.spyOn(provider, 'deleteDbInstance')
+      reg.getProvisioningJob.mockResolvedValue(job({ created_resources: ready }))
+      await rollbackProvisioning('t-1', provider)
+      expect(provider.databases.size).toBe(0)
+      expect(del).not.toHaveBeenCalled()
+      expect(sharedDb.releaseSharedDbSeat).toHaveBeenCalledWith('jeffi-starter-1')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('restore_data / seed_data (opt-in only)', () => {
+    it('is a no-op passthrough when the job carries no restore key', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'restore_data', created_resources: { endpoint: 'ep' } }), provider)
+      expect(backupStore.getTenantBackup).not.toHaveBeenCalled()
+      expect(patches().some(p => p.step === 'seed_data')).toBe(true)
+    })
+
+    it('restores from the backup when a key IS present', async () => {
+      backupStore.getTenantBackup.mockResolvedValue(Buffer.from('archive'))
+      const spy = vi.spyOn(provider, 'restoreDb')
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(
+        job({ step: 'restore_data', created_resources: { endpoint: 'ep', restoreFromKey: 'k/1.sql.gz' } }),
+        provider
+      )
+      expect(backupStore.getTenantBackup).toHaveBeenCalledWith('k/1.sql.gz')
+      expect(spy).toHaveBeenCalledWith('ep', 'jeffi_stores', expect.any(Buffer))
+      expect(patches().find(p => p.step === 'seed_data')?.created_resources).toMatchObject({ restored: true })
+    })
+
+    it('seed_data does nothing without a seedProfile (empty store is the default)', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'seed_data', created_resources: { endpoint: 'ep' } }), provider)
+      expect(seedMod.seedTenantData).not.toHaveBeenCalled()
+      expect(patches().some(p => p.step === 'create_bucket')).toBe(true)
+    })
+
+    it('seed_data seeds when a profile is present', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(
+        job({ step: 'seed_data', created_resources: { endpoint: 'ep', seedProfile: 'hardware' } }),
+        provider
+      )
+      expect(seedMod.seedTenantData).toHaveBeenCalledWith('ep', 'jeffi_stores', 'hardware')
+    })
+
+    it('seed_data is SKIPPED when the store was restored (never overwrite restored data)', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(
+        job({ step: 'seed_data', created_resources: { endpoint: 'ep', seedProfile: 'hardware', restored: true } }),
+        provider
+      )
+      expect(seedMod.seedTenantData).not.toHaveBeenCalled()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('configure_dns — hostnames by plan tier', () => {
+    it('basic gets storefront + admin + invoice only', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'configure_dns' }), provider)
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('admin-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('invoice-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('quotation-acme.jeffistores.in')).toBe(false)
+    })
+
+    it('growth adds quotation + purchaseorder + forms (review_forms is sold from Growth)', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, plan: 'growth' })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'configure_dns' }), provider)
+      expect(provider.hasDns('quotation-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('purchaseorder-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('forms-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('acme.business.jeffistores.in')).toBe(false)
+    })
+
+    it('pro adds business', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, plan: 'pro' })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'configure_dns' }), provider)
+      expect(provider.hasDns('forms-acme.jeffistores.in')).toBe(true)
+      expect(provider.hasDns('acme.business.jeffistores.in')).toBe(true)
+    })
+
+    it('a null plan still gets the basic hostnames', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, plan: null })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'configure_dns' }), provider)
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(true)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('verify_serving — proves the host answers before going live', () => {
+    // The probe only runs under the real AWS provider; under the stub it is skipped
+    // (there is no real host to reach), so these tests set the provider to 'aws' to
+    // exercise the fetch-based verification path.
+    beforeEach(() => {
+      process.env.PROVISIONING_PROVIDER = 'aws'
+    })
+    afterEach(() => {
+      delete process.env.PROVISIONING_PROVIDER
+    })
+
+    it('advances to activate when the host responds', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200 }))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'verify_serving' }), provider)
+      expect(patches().some(p => p.step === 'activate')).toBe(true)
+    })
+
+    it('accepts any HTTP status as proof the app tier answers (even 404)', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 404 }))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'verify_serving' }), provider)
+      expect(patches().some(p => p.step === 'activate')).toBe(true)
+    })
+
+    it('stays pending and counts an attempt when the host is unreachable', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'verify_serving' }), provider)
+      expect(res).toBe('pending')
+      expect(lastPatch().created_resources).toMatchObject({ verifyAttempts: 1 })
+    })
+
+    it('gives up on the host after the attempt budget and records why', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('timeout')))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(
+        job({ step: 'verify_serving', created_resources: { verifyAttempts: 5 } }),
+        provider
+      )
+
+      // The step throws once its 6 in-step attempts are used up. Note the thrown
+      // message is NOT in isTerminalError's list, so it is classified RETRYABLE:
+      // the job stays 'pending' and is retried at the JOB level (capped at 8
+      // attempts) before finally failing. Crucially it never reaches 'activate'.
+      expect(res).toBe('pending')
+      expect(String(lastPatch().last_error ?? '')).toMatch(/did not serve after 6 attempts/)
+      expect(patches().some(p => p.step === 'activate')).toBe(false)
+    })
+
+    it('finally FAILS (and never activates) once job-level attempts are also exhausted', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('timeout')))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(
+        job({ step: 'verify_serving', attempts: 7, created_resources: { verifyAttempts: 5, stepErrors: 7 } }),
+        provider
+      )
+      expect(res).toBe('failed')
+      expect(reg.setTenantStatus).not.toHaveBeenCalledWith('t-1', 'active')
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('activate — the cross-tenant-leak guard', () => {
+    it('REFUSES to activate when rds_endpoint was never persisted', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: null })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'activate' }), provider)
+      expect(res).toBe('failed')
+      expect(String(lastPatch().last_error ?? '')).toMatch(/activate blocked/)
+      expect(reg.setTenantStatus).not.toHaveBeenCalledWith('t-1', 'active')
+    })
+
+    it('activates and marks the job done when infra is persisted', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1.rds.amazonaws.com' })
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'activate' }), provider)
+      expect(res).toBe('done')
+      expect(reg.setTenantStatus).toHaveBeenCalledWith('t-1', 'active')
+      expect(lastPatch()).toMatchObject({ status: 'done' })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('pinned pipeline', () => {
+    const pinned = (...ids: string[]) => ({ v: 2, jobs: [{ id: 'all', label: 'All', steps: ids.map(id => ({ id, label: id })) }] })
+
+    it('moves to the next step of the pinned pipeline, not the legacy list', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(
+        job({ step: 'setup_delhivery', pipeline: pinned('setup_delhivery', 'issue_owner_certificate', 'activate') }),
+        provider
+      )
+      expect(res).toBe('pending')
+      expect(patches().some(p => p.step === 'issue_owner_certificate')).toBe(true)
+      expect(patches().some(p => p.step === 'configure_dns')).toBe(false)
+    })
+
+    it('fails a step that is not in the pinned pipeline', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'configure_dns', pipeline: pinned('ensure_compute', 'activate') }), provider)
+      expect(res).toBe('failed')
+      expect(String(lastPatch().last_error)).toMatch(/unknown step configure_dns/)
+    })
+
+    it('an owner certificate that keeps failing ends in a warning and the store still goes live (no rollback)', async () => {
+      process.env.PROVISIONING_PROVIDER = 'aws'
+      const ensureOwnerAdmin = vi.fn().mockResolvedValue({ success: false, error: 'tenant DB unreachable', emailed: false, revoked: [], caCreated: false })
+      vi.doMock('@controller/lib/tenancy/tenant-admin-provision', () => ({ ensureOwnerAdmin }))
+      vi.doMock('@controller/lib/provisioning/alerts', () => ({ alertProvisioningFailure: vi.fn().mockResolvedValue(undefined) }))
+      try {
+        const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+        const res = await advanceProvisioningJob(
+          job({ step: 'issue_owner_certificate', pipeline: pinned('issue_owner_certificate', 'activate'), created_resources: { stepErrors: 3 } }),
+          provider
+        )
+        expect(res).toBe('pending')
+        expect(ensureOwnerAdmin).toHaveBeenCalled()
+        expect(lastPatch()).toMatchObject({ step: 'activate', status: 'pending' })
+        expect(patches().some(p => p.status === 'failed')).toBe(false)
+        const { alertProvisioningFailure } = await import('@controller/lib/provisioning/alerts')
+        expect(alertProvisioningFailure).toHaveBeenCalledWith('acme', 'owner_admin_cert', expect.stringMatching(/unreachable/), 't-1')
+      } finally {
+        vi.doUnmock('@controller/lib/tenancy/tenant-admin-provision')
+        vi.doUnmock('@controller/lib/provisioning/alerts')
+        delete process.env.PROVISIONING_PROVIDER
+      }
+    })
+
+    it('skips the owner certificate under the stub provider', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      await advanceProvisioningJob(job({ step: 'issue_owner_certificate', pipeline: pinned('issue_owner_certificate', 'activate') }), provider)
+      expect(lastPatch()).toMatchObject({ step: 'activate', status: 'pending' })
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('unknown step', () => {
+    it('fails rather than silently looping', async () => {
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'not_a_real_step' }), provider)
+      expect(res).toBe('failed')
+      expect(String(lastPatch().last_error ?? '')).toMatch(/unknown step/)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('error classification: retry vs terminal', () => {
+    it('a TRANSIENT error keeps the job pending and schedules a backoff', async () => {
+      vi.spyOn(provider, 'ensureBucket').mockRejectedValue(new Error('ECONNRESET talking to S3'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'create_bucket', attempts: 1, created_resources: { stepErrors: 1 } }), provider)
+      expect(res).toBe('pending')
+      const p = lastPatch()
+      expect(p.status).toBe('pending')
+      expect(p.nextAttemptAt).toBeInstanceOf(Date)
+      expect(String(p.last_error)).toMatch(/retryable \(attempt 2\)/)
+    })
+
+    it('a TERMINAL error (AccessDenied) fails immediately without burning retries', async () => {
+      vi.spyOn(provider, 'ensureBucket').mockRejectedValue(new Error('AccessDenied: not authorized'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'create_bucket' }), provider)
+      expect(res).toBe('failed')
+    })
+
+    it('bad SQL at load_schema (SQLSTATE 42601) fails at once and rolls back, with no backoff', async () => {
+      vi.spyOn(provider, 'loadSchema').mockRejectedValue(Object.assign(new Error('syntax error at or near "store"'), { code: '42601' }))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'load_schema', created_resources: { endpoint: 'ep-1' } }), provider)
+      expect(res).toBe('failed')
+      expect(patches().find(p => p.status === 'failed')?.last_error).toMatch(/syntax error at or near "store"/)
+      expect(patches().some(p => p.nextAttemptAt)).toBe(false)
+      expect(reg.setTenantStatus).toHaveBeenCalledWith('t-1', 'suspended')
+    })
+
+    it('bad SQL at restore_data is terminal by its message alone (no SQLSTATE)', async () => {
+      backupStore.getTenantBackup.mockResolvedValue(Buffer.from('archive'))
+      vi.spyOn(provider, 'restoreDb').mockRejectedValue(new Error('column "legacy_flag" of relation "products" does not exist'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'restore_data', created_resources: { endpoint: 'ep', restoreFromKey: 'k/1.sql.gz' } }), provider)
+      expect(res).toBe('failed')
+    })
+
+    it('a connection error at load_schema is still retried', async () => {
+      vi.spyOn(provider, 'loadSchema').mockRejectedValue(new Error('Connection terminated due to connection timeout'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'load_schema', created_resources: { endpoint: 'ep-1' } }), provider)
+      expect(res).toBe('pending')
+      expect(lastPatch().nextAttemptAt).toBeInstanceOf(Date)
+    })
+
+    it('classifies SQL class 42 as terminal; connection, timeout, busy-server and AWS throttling errors as retryable', async () => {
+      const { isTerminalError } = await import('@controller/lib/provisioning/steps')
+      const pg = (message: string, code: string) => Object.assign(new Error(message), { code })
+      const terminal: [string, unknown?][] = [
+        ['syntax error at or near "store"'],
+        ['syntax error at end of input'],
+        ['relation "site_pages" does not exist'],
+        ['column "published_doc" of relation "site_pages" does not exist'],
+        ['function gen_random_uuid() does not exist'],
+        ['type "citext" does not exist'],
+        ['multiple primary keys for table "orders" are not allowed', pg('multiple primary keys for table "orders" are not allowed', '42P16')],
+        ['generation expression is not immutable', pg('generation expression is not immutable', '42P17')],
+      ]
+      for (const [msg, err] of terminal) expect(isTerminalError(msg, err), msg).toBe(true)
+      const retryable: [string, unknown?][] = [
+        ['Connection terminated unexpectedly'],
+        ['connect ECONNREFUSED 10.0.0.5:5432', Object.assign(new Error('connect ECONNREFUSED 10.0.0.5:5432'), { code: 'ECONNREFUSED' })],
+        ['timeout expired'],
+        ['the database system is starting up', pg('the database system is starting up', '57P03')],
+        ['sorry, too many clients already', pg('sorry, too many clients already', '53300')],
+        ['canceling statement due to statement timeout', pg('canceling statement due to statement timeout', '57014')],
+        ['deadlock detected', pg('deadlock detected', '40P01')],
+        ['ThrottlingException: Rate exceeded'],
+        ['RequestLimitExceeded: Request limit exceeded.'],
+      ]
+      for (const [msg, err] of retryable) expect(isTerminalError(msg, err), msg).toBe(false)
+    })
+
+    it('gives up once the attempt cap is reached even for a transient error', async () => {
+      vi.spyOn(provider, 'ensureBucket').mockRejectedValue(new Error('ETIMEDOUT'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+      const res = await advanceProvisioningJob(job({ step: 'create_bucket', attempts: 7, created_resources: { stepErrors: 7 } }), provider)
+      expect(res).toBe('failed')
+    })
+
+    it('backoff grows with the attempt number', async () => {
+      vi.spyOn(provider, 'ensureBucket').mockRejectedValue(new Error('ECONNRESET'))
+      const { advanceProvisioningJob } = await import('@controller/lib/provisioning/steps')
+
+      await advanceProvisioningJob(job({ step: 'create_bucket', attempts: 0 }), provider)
+      const first = (lastPatch().nextAttemptAt as Date).getTime() - Date.now()
+      vi.clearAllMocks()
+      reg.updateProvisioningJob.mockResolvedValue(undefined)
+      reg.getTenant.mockResolvedValue({ ...TENANT })
+
+      await advanceProvisioningJob(job({ step: 'create_bucket', attempts: 4, created_resources: { stepErrors: 4 } }), provider)
+      const later = (lastPatch().nextAttemptAt as Date).getTime() - Date.now()
+      expect(later).toBeGreaterThan(first)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('reprovisionDns — DNS-only plan-change re-apply (never recreates infra)', () => {
+    const ACTIVE = { ...TENANT, status: 'active', rds_endpoint: 'ep-1.rds.amazonaws.com' }
+
+    it('refuses when the tenant is not active / has no infra', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, status: 'provisioning', rds_endpoint: null })
+      const { reprovisionDns } = await import('@controller/lib/provisioning/steps')
+      const out = await reprovisionDns('t-1', provider)
+      expect(out.ok).toBe(false)
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(false)
+    })
+
+    it('UPGRADE basic → growth crosses into dedicated: stands up EC2 and repoints all hosts', async () => {
+      reg.getTenant.mockResolvedValue({ ...ACTIVE, plan: 'growth' })
+      // Previously applied = basic hostnames, on the shared pool (no dedicated EC2 yet).
+      reg.getProvisioningJob.mockResolvedValue(
+        job({
+          status: 'done',
+          created_resources: {
+            dnsHosts: ['acme.jeffistores.in', 'admin-acme.jeffistores.in', 'invoice-acme.jeffistores.in'],
+          },
+        })
+      )
+      const ensureEc2 = vi.spyOn(provider, 'ensureAppInstance')
+      const ensure = vi.spyOn(provider, 'ensureDns')
+      const remove = vi.spyOn(provider, 'removeDns')
+      const { reprovisionDns } = await import('@controller/lib/provisioning/steps')
+      const out = await reprovisionDns('t-1', provider)
+      expect(out.ok).toBe(true)
+      // growth is a dedicated plan; basic used the pool → a dedicated EC2 is provisioned
+      // and the tenant's serving IP is persisted.
+      expect(ensureEc2).toHaveBeenCalled()
+      expect(reg.writeTenantEc2).toHaveBeenCalledWith('t-1', expect.any(String))
+      // Compute moved → every desired host is repointed at the new target (added = full set).
+      const desired = [
+        'acme.jeffistores.in',
+        'admin-acme.jeffistores.in',
+        'invoice-acme.jeffistores.in',
+        'vault-acme.jeffistores.in',
+        'quotation-acme.jeffistores.in',
+        'purchaseorder-acme.jeffistores.in',
+        'forms-acme.jeffistores.in',
+      ]
+      expect(out.added).toEqual(desired)
+      expect(out.removed).toEqual([])
+      expect(ensure).toHaveBeenCalledWith(desired, expect.any(String))
+      expect(remove).not.toHaveBeenCalled()
+      // Persists the now-authoritative host set.
+      expect(lastPatch().created_resources.dnsHosts).toContain('quotation-acme.jeffistores.in')
+    })
+
+    it('DOWNGRADE removes the dropped higher-tier hostnames (pro → basic)', async () => {
+      reg.getTenant.mockResolvedValue({ ...ACTIVE, plan: 'basic' })
+      reg.getProvisioningJob.mockResolvedValue(
+        job({
+          status: 'done',
+          created_resources: {
+            dnsHosts: [
+              'acme.jeffistores.in',
+              'admin-acme.jeffistores.in',
+              'invoice-acme.jeffistores.in',
+              'vault-acme.jeffistores.in',
+              'quotation-acme.jeffistores.in',
+              'purchaseorder-acme.jeffistores.in',
+              'forms-acme.jeffistores.in',
+              'acme.business.jeffistores.in',
+            ],
+          },
+        })
+      )
+      const remove = vi.spyOn(provider, 'removeDns')
+      const { reprovisionDns } = await import('@controller/lib/provisioning/steps')
+      const out = await reprovisionDns('t-1', provider)
+      expect(out.ok).toBe(true)
+      expect(out.added).toEqual([])
+      expect(out.removed).toEqual(
+        expect.arrayContaining([
+          'quotation-acme.jeffistores.in',
+          'purchaseorder-acme.jeffistores.in',
+          'forms-acme.jeffistores.in',
+          'acme.business.jeffistores.in',
+        ])
+      )
+      expect(remove).toHaveBeenCalled()
+    })
+
+    it('backfills the vault host for a tenant provisioned before it existed', async () => {
+      reg.getTenant.mockResolvedValue({ ...ACTIVE, plan: 'basic' })
+      reg.getProvisioningJob.mockResolvedValue(
+        job({
+          status: 'done',
+          created_resources: {
+            dnsHosts: ['acme.jeffistores.in', 'admin-acme.jeffistores.in', 'invoice-acme.jeffistores.in'],
+          },
+        })
+      )
+      const { reprovisionDns } = await import('@controller/lib/provisioning/steps')
+      const out = await reprovisionDns('t-1', provider)
+      expect(out.added).toEqual(['vault-acme.jeffistores.in'])
+      expect(out.removed).toEqual([])
+    })
+
+    it('is a no-op when the tier is unchanged', async () => {
+      reg.getTenant.mockResolvedValue({ ...ACTIVE, plan: 'basic' })
+      reg.getProvisioningJob.mockResolvedValue(
+        job({
+          status: 'done',
+          created_resources: {
+            dnsHosts: ['acme.jeffistores.in', 'admin-acme.jeffistores.in', 'invoice-acme.jeffistores.in', 'vault-acme.jeffistores.in'],
+          },
+        })
+      )
+      const ensure = vi.spyOn(provider, 'ensureDns')
+      const remove = vi.spyOn(provider, 'removeDns')
+      const { reprovisionDns } = await import('@controller/lib/provisioning/steps')
+      const out = await reprovisionDns('t-1', provider)
+      expect(out.added).toEqual([])
+      expect(out.removed).toEqual([])
+      expect(ensure).not.toHaveBeenCalled()
+      expect(remove).not.toHaveBeenCalled()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  describe('deprovisionTenant — backup-first teardown', () => {
+    it('returns an error for an unknown tenant', async () => {
+      reg.getTenant.mockResolvedValue(null)
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      await expect(deprovisionTenant('nope', provider, {})).resolves.toMatchObject({
+        ok: false,
+        error: 'tenant not found',
+      })
+    })
+
+    it('takes the store OFFLINE first, then backs up, then deletes', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1', s3_bucket: 'jeffi-tenant-acme' })
+      backupStore.putTenantBackup.mockResolvedValue({ ownerKey: 'tenant-backups/owner-1/acme.sql.gz' })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'owner-1' })
+
+      expect(reg.setTenantStatus).toHaveBeenCalledWith('t-1', 'terminated')
+      expect(reg.clearTenantCache).toHaveBeenCalled()
+      expect(out).toMatchObject({ ok: true, backedUp: true, backupKey: 'tenant-backups/owner-1/acme.sql.gz' })
+      expect(reg.clearTenantInfra).toHaveBeenCalledWith('t-1')
+    })
+
+    it('keeps everything for the owner when nobody chose (a cancelled subscription)', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, display_name: 'Acme', rds_endpoint: 'ep-1', s3_bucket: 'jeffi-tenant-acme' })
+      backupStore.putTenantBackup.mockResolvedValue({ ownerKey: 'tenant-backups/by-owner/owner-1/x.sql.gz' })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'owner-1' })
+
+      expect(out).toMatchObject({ ok: true, archiveId: 'arch-1' })
+      expect(provider.archivedBuckets.get('tenant-backups/media/owner-1/acme/STAMP/')).toBe('jeffi-tenant-acme')
+      expect(archives.createTenantArchive).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tenantId: 't-1',
+          ownerId: 'owner-1',
+          slug: 'acme',
+          dbBackupKey: 'tenant-backups/by-owner/owner-1/x.sql.gz',
+          mediaPrefix: 'tenant-backups/media/owner-1/acme/STAMP/',
+          config: expect.objectContaining({ displayName: 'Acme', plan: 'basic', siteSettings: {} }),
+        })
+      )
+      expect(backupStore.deleteTenantBackups).not.toHaveBeenCalled()
+    })
+
+    it('keeps only what the administrator chose and deletes the rest with no copy', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1', s3_bucket: 'jeffi-tenant-acme' })
+      const backup = vi.spyOn(provider, 'backupDb')
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+
+      const out = await deprovisionTenant('t-1', provider, {
+        ownerId: 'owner-1',
+        keep: { database: false, media: true, config: false },
+        requestedBy: 'admin@example.com',
+      })
+
+      expect(out).toMatchObject({ ok: true, backedUp: false, backupKey: null, archiveId: 'arch-1' })
+      expect(backup).not.toHaveBeenCalled()
+      expect(backupStore.putTenantBackup).not.toHaveBeenCalled()
+      // The database was not kept, so earlier backups of this store go too.
+      expect(backupStore.deleteTenantBackups).toHaveBeenCalledWith({ ownerId: 'owner-1', slug: 'acme' })
+      expect(archives.createTenantArchive).toHaveBeenCalledWith(
+        expect.objectContaining({ dbBackupKey: null, mediaPrefix: 'tenant-backups/media/owner-1/acme/STAMP/', config: null, requestedBy: 'admin@example.com' })
+      )
+    })
+
+    it('records no archive when the administrator kept nothing', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1', s3_bucket: 'jeffi-tenant-acme' })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'owner-1', keep: { database: false, media: false, config: false } })
+
+      expect(out).toMatchObject({ ok: true, archiveId: null })
+      expect(provider.archivedBuckets.size).toBe(0)
+      expect(archives.createTenantArchive).not.toHaveBeenCalled()
+    })
+
+    it('deletes nothing when the media files could not be copied', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1', s3_bucket: 'jeffi-tenant-acme' })
+      backupStore.putTenantBackup.mockResolvedValue({ ownerKey: 'k' })
+      vi.spyOn(provider, 'archiveBucket').mockRejectedValue(new Error('copy failed'))
+      const delDb = vi.spyOn(provider, 'deleteDbInstance')
+      const delBucket = vi.spyOn(provider, 'deleteBucket')
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'owner-1' })
+
+      expect(out).toMatchObject({ ok: false, error: 'copy failed' })
+      expect(delDb).not.toHaveBeenCalled()
+      expect(delBucket).not.toHaveBeenCalled()
+      expect(archives.createTenantArchive).not.toHaveBeenCalled()
+    })
+
+    it('skips the backup for a tenant that never had a database', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: null })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'o-1' })
+      expect(out).toMatchObject({ ok: true, backedUp: false, backupKey: null })
+      expect(backupStore.putTenantBackup).not.toHaveBeenCalled()
+    })
+
+    it('removes the tenant DNS records so subdomains stop resolving', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: null })
+      await provider.ensureDns(['acme.jeffistores.in'])
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      await deprovisionTenant('t-1', provider, {})
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(false)
+    })
+
+    it('retries a transient removeDns failure and self-heals (no manual cleanup)', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: null })
+      await provider.ensureDns(['acme.jeffistores.in'])
+      const realRemove = provider.removeDns.bind(provider)
+      let calls = 0
+      vi.spyOn(provider, 'removeDns').mockImplementation(async (hosts: string[]) => {
+        calls++
+        if (calls < 3) throw new Error(`Route53 DELETE failed for x (503): ServiceUnavailable`)
+        return realRemove(hosts)
+      })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      const out = await deprovisionTenant('t-1', provider, {})
+      expect(out.ok).toBe(true)
+      expect(calls).toBe(3)
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(false)
+    })
+
+    it('does NOT retry a non-transient removeDns failure — records dnsHosts once', async () => {
+      reg.getProvisioningJob.mockResolvedValue(
+        job({ status: 'done', created_resources: { dnsHosts: ['acme.jeffistores.in'] } })
+      )
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: null })
+      await provider.ensureDns(['acme.jeffistores.in'])
+      const remove = vi
+        .spyOn(provider, 'removeDns')
+        .mockRejectedValue(new Error('Route53 DELETE failed for x (400): InvalidChangeBatch'))
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      const out = await deprovisionTenant('t-1', provider, {})
+      expect(out.ok).toBe(true)
+      expect(remove).toHaveBeenCalledTimes(1)
+      expect(provider.hasDns('acme.jeffistores.in')).toBe(true)
+      const patch = reg.updateProvisioningJob.mock.calls.at(-1)?.[1]
+      expect(patch?.created_resources?.manualCleanup?.dnsHosts).toEqual(['acme.jeffistores.in'])
+    })
+
+    it('reports failure when the backup throws (does NOT delete blindly)', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1' })
+      vi.spyOn(provider, 'backupDb').mockRejectedValue(new Error('dump failed'))
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      const out = await deprovisionTenant('t-1', provider, { ownerId: 'o-1' })
+      expect(out.ok).toBe(false)
+      expect(String(out.error)).toMatch(/dump failed/)
+    })
+
+    it('uses "unknown" as the owner key when no ownerId is supplied', async () => {
+      reg.getTenant.mockResolvedValue({ ...TENANT, rds_endpoint: 'ep-1' })
+      backupStore.putTenantBackup.mockResolvedValue({ ownerKey: 'k' })
+      const { deprovisionTenant } = await import('@controller/lib/provisioning/steps')
+      await deprovisionTenant('t-1', provider, {})
+      expect(backupStore.putTenantBackup).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerId: 'unknown', slug: 'acme' })
+      )
+    })
+  })
+})

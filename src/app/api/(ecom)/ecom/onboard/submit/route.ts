@@ -1,0 +1,262 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { cookies } from 'next/headers'
+import type { z } from 'zod'
+import { OWNER_COOKIE, resolveOwnerSession } from '@/lib/auth/owner-session'
+import { extractSessionSignals } from '@/lib/auth/session-signals-request'
+import {
+  createTenant,
+  linkOwnerTenant,
+  hasVerifiedBank,
+  saveSubscriptionId,
+  listPlans,
+  getOwnerTenants,
+  saveKyc,
+  markDraftSubmitted,
+  getDraft,
+  saveDraft,
+  saveIntegrationCredential,
+  updateOwnerName,
+  hasService,
+  applyStoreUpgrade,
+} from '@/lib/tenant-registry'
+import { sendKycSubmittedEmail } from '@/lib/shared/ecom-emails'
+import { OnboardSchema } from '@controller/lib/catalog/onboard-schema'
+import { encryptToken } from '@/lib/crypto/token-cipher'
+import { dedicatedCapacityError } from '@controller/lib/k8s/capacity'
+import { verifyDelhiveryToken } from '@/lib/shipping/delhivery'
+import { computeSpecEnabled, getCatalog, planCompute } from '@controller/lib/compute/catalog'
+import { presetSpec } from '@/lib/compute/presets'
+import { quoteForPlan } from '@controller/lib/compute/quote'
+import { saveDesiredCompute } from '@controller/lib/compute/store'
+import type { ComputeSpec } from '@/lib/compute/spec'
+import { setRequestedAddons } from '@/lib/billing/requested-addons'
+import { requestDomain } from '@controller/lib/domains/orders'
+import { categoryList, cleanDocNumber, compliancePlan, requiredDocs } from '@controller/lib/catalog/compliance'
+import { saveComplianceDocuments } from '@controller/lib/catalog/compliance-docs'
+import { kycKeyPrefix } from '@controller/lib/catalog/kyc-upload'
+import { cleanSocials, whatsappDigits } from '@/lib/catalog/store-socials'
+import { REVIEW_STEP } from '@controller/app/(ecom)/ecom/onboard/steps'
+
+export const dynamic = 'force-dynamic'
+
+export async function POST(request: NextRequest) {
+  const sid = (await cookies()).get(OWNER_COOKIE)?.value
+  const owner = await resolveOwnerSession(sid, extractSessionSignals(request))
+  if (!owner) return NextResponse.json({ error: 'Not signed in' }, { status: 401 })
+
+  // One store per owner. A services workspace without a store applies for one on its own tenant.
+  // A terminated (deprovisioned) store does not count: its owner may apply again.
+  const existing = (await getOwnerTenants(owner.id)).filter(t => t.status !== 'terminated')
+  const upgrade = existing.length === 1 && !hasService(existing[0], 'store') && !existing[0].store_request ? existing[0] : null
+  if (existing.length > 0 && !upgrade) return NextResponse.json({ error: 'You already have a store.' }, { status: 400 })
+
+  // Bank must be verified before submitting
+  if (!(await hasVerifiedBank(owner.id))) {
+    return NextResponse.json({ error: 'Please verify your bank account before submitting.' }, { status: 400 })
+  }
+
+  const raw = await request.json().catch(() => null)
+  if (!raw) return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
+  const parsed = OnboardSchema.safeParse(raw)
+  if (!parsed.success) return NextResponse.json({ error: parsed.error.issues[0]?.message }, { status: 400 })
+
+  const d = parsed.data
+
+  // Legal consent is required to generate the tenant's legal pages.
+  if (!d.legalsAccepted) {
+    return NextResponse.json({ error: 'Please accept the legal terms to continue.' }, { status: 400 })
+  }
+
+  // The licences the categories need (the schema checked each is complete), each uploaded by this owner as that type.
+  const licences = requiredDocs(compliancePlan(categoryList(d.productCategories)), d.compliance?.answers ?? {}).map(({ doc, category }) => ({
+    doc,
+    category,
+    upload: d.compliance?.docs?.[doc],
+  }))
+  if (licences.some(l => !l.upload?.s3Key.startsWith(kycKeyPrefix(owner.id, l.doc)))) {
+    return NextResponse.json({ error: 'Upload your licences again in the Store step, then submit.' }, { status: 400 })
+  }
+
+  // A mistyped Delhivery token would otherwise only surface at the store's first shipment. Only a
+  // positive refusal blocks the submit; if Delhivery cannot be reached the token is accepted, and
+  // the owner can replace it from the dashboard.
+  if (d.ownDelhivery && d.delhiveryToken && (await verifyDelhiveryToken(d.delhiveryToken.trim())) === 'invalid') {
+    return NextResponse.json(
+      { error: 'Delhivery did not accept this API token. Check it and try again.' },
+      { status: 400 }
+    )
+  }
+
+  // The server size the owner chose (when they may choose), else the plan's floor; Basic is one fixed
+  // shape with only its database chosen (on the server or RDS). Always saved with its price: approval and
+  // the dashboard read tenant_compute.price_inr_month.
+  const plan = await planCompute(d.planSlug)
+  if (!plan) return NextResponse.json({ error: 'Unknown plan' }, { status: 400 })
+  const compute: ComputeSpec =
+    d.planSlug === 'basic'
+      ? computeSpecEnabled() && d.compute?.db.mode === 'dedicated'
+        ? { ...presetSpec('basic'), db: d.compute.db }
+        : presetSpec('basic')
+      : computeSpecEnabled() && d.compute
+        ? d.compute
+        : presetSpec(plan.minPreset ?? plan.defaultPreset ?? 'small')
+  if (computeSpecEnabled()) {
+    const q = await quoteForPlan(compute, plan, await getCatalog())
+    if (!q.validation.ok) return NextResponse.json({ error: q.validation.errors[0] ?? 'Choose a server size.' }, { status: 400 })
+    if (q.capacityError) return NextResponse.json({ error: q.capacityError, code: 'capacity' }, { status: 409 })
+  } else {
+    const capacityError = await dedicatedCapacityError(d.planSlug)
+    if (capacityError) return NextResponse.json({ error: capacityError, code: 'capacity' }, { status: 409 })
+  }
+
+  // 1. Create tenant with status='pending_approval' (NOT provisioning yet). An upgrade keeps its
+  //    tenant (and status); the application is tracked on store_request until the first payment.
+  const result = upgrade
+    ? await applyStoreUpgrade(upgrade.id, d).then(r =>
+        r.ok ? { ok: true as const, tenantId: upgrade.id, slug: upgrade.slug } : r
+      )
+    : await createTenant({
+    slug: d.slug,
+    displayName: d.displayName,
+    planSlug: d.planSlug,
+    billingInterval: d.billingInterval,
+    dailyPayout: d.dailyPayout,
+    ownDelhivery: d.ownDelhivery,
+    ownRazorpay: d.ownRazorpay,
+    warehouse: d.warehouse,
+    status: 'pending_approval',
+    serviceTypes: ['store', ...d.extraServices],
+    reclaimForOwnerId: owner.id,
+  })
+  if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 })
+
+  // 2. Link owner → tenant.
+  if (!upgrade) await linkOwnerTenant(owner.id, result.tenantId)
+  await saveDesiredCompute(result.tenantId, compute)
+  // Charged from the wallet only once the store is live; a failed save must not lose the application.
+  await setRequestedAddons(result.tenantId, d.addons).catch(e => console.warn('[onboard] add-ons not saved', e?.message || e))
+
+  // 2a. Provisioning names the owner admin and addresses the access certificate from owners.name.
+  await updateOwnerName(owner.id, d.ownerName)
+
+  // 2b. Own-Razorpay tenant: persist their collection creds, encrypted. This is the ONLY place the
+  //     raw key_secret/webhook_secret is handled — it arrives over TLS and is encrypted immediately;
+  //     it never entered the cleartext onboarding draft. key_id is public.
+  if (d.ownRazorpay && d.razorpayKeyId && d.razorpayKeySecret) {
+    await saveIntegrationCredential({
+      tenantId: result.tenantId,
+      provider: 'razorpay',
+      label: 'Razorpay',
+      configEnc: encryptToken(
+        JSON.stringify({
+          key_id: d.razorpayKeyId,
+          key_secret: d.razorpayKeySecret,
+          webhook_secret: d.razorpayWebhookSecret || undefined,
+        })
+      ),
+      meta: { key_id: d.razorpayKeyId },
+    })
+  }
+
+  // 2c. Own-Delhivery tenant: persist their Delhivery token, encrypted. Same handling as the Razorpay
+  //     secret — arrives over TLS, encrypted immediately, never entered the cleartext draft. This is
+  //     what resolveDelhiveryToken / hasOwnDelhiveryToken read (cfg.token), so shipments sign with it.
+  if (d.ownDelhivery && d.delhiveryToken) {
+    await saveIntegrationCredential({
+      tenantId: result.tenantId,
+      provider: 'delhivery',
+      label: 'Delhivery',
+      configEnc: encryptToken(JSON.stringify({ token: d.delhiveryToken.trim() })),
+      meta: {},
+    })
+  }
+
+  // 3. Save KYC details for admin review (an upgrade's auto-approved services KYC goes back to review).
+  await saveKyc(result.tenantId, owner.id, {
+    gst_number: d.gstNumber || null,
+    gst_cert_s3_key: d.gstCertS3Key ?? null,
+    pan: d.pan,
+    business_name: d.businessName,
+    business_type: d.businessType,
+    business_address: d.businessAddress,
+    product_categories: d.productCategories ?? null,
+    mobile: d.mobile ?? null,
+    logo_s3_key: d.logoS3Key ?? null,
+    seal_s3_key: d.sealS3Key ?? null,
+    warehouse: d.warehouse ?? (await getDraft(owner.id))?.data?.wh ?? null,
+    store_profile: storeProfile(d),
+    legals_accepted: !!d.legalsAccepted,
+    review_again: !!upgrade,
+  })
+
+  // 3b. The licences, for review with the KYC. A failed save must not lose the application: the draft keeps them.
+  await saveComplianceDocuments(
+    result.tenantId,
+    owner.id,
+    licences.map(l => ({
+      docType: l.doc,
+      category: l.category,
+      number: cleanDocNumber(l.upload!.number ?? '') || null,
+      expiresOn: l.upload!.expiresOn || null,
+      s3Key: l.upload!.s3Key,
+      fileName: l.upload!.fileName ?? null,
+    }))
+  ).catch(e => console.error('[onboard] licences not saved', e?.message || e))
+
+  // 3a. The domain the owner chose: bought from the wallet once the store is approved. Never blocks the application.
+  let domainError: string | undefined
+  if (d.domain) {
+    const r = await requestDomain({ tenantId: result.tenantId, domain: d.domain.name, contact: d.domain.contact }).catch(e => ({ ok: false as const, error: String(e?.message || e) }))
+    if (!r.ok) domainError = r.error
+  }
+
+  // 4. Persist restore intent (if any) into the draft, then mark submitted. The
+  //    provision step reads this to decide whether to restore the owner's prior backup.
+  // An upgrade's warehouse lives on the draft too: approval reads it for the Route linked account.
+  // `restore` names one of the owner's archives and the items to bring back; it is checked against
+  // that archive (owner, expiry, what it kept) when provisioning reads it.
+  const restore = d.restore && (d.restore.database || d.restore.media || d.restore.config) ? d.restore : null
+  {
+    // Always rewritten: a restore choice left on the draft by an earlier application must not apply to this one.
+    const { restore: _oldRestore, restorePreviousData: _oldFlag, ...existing } = ((await getDraft(owner.id))?.data ?? {}) as Record<string, any>
+    await saveDraft(owner.id, REVIEW_STEP, {
+      ...existing,
+      stepId: 'review',
+      ...(d.restorePreviousData ? { restorePreviousData: true } : {}),
+      ...(restore ? { restore } : {}),
+      ...(upgrade && d.warehouse ? { wh: { ...existing.wh, ...d.warehouse } } : {}),
+    })
+  }
+  await markDraftSubmitted(owner.id)
+
+  // 5. Notify owner + platform admin.
+  sendKycSubmittedEmail({ email: owner.email, name: d.ownerName }).catch(() => {})
+
+  return NextResponse.json({
+    ok: true,
+    tenantId: result.tenantId,
+    slug: result.slug,
+    status: 'pending_approval',
+    ...(domainError ? { domainError } : {}),
+  })
+}
+
+/** The Store step's site details as tenant_kyc.store_profile keeps them (the schema checked each); null when none. */
+function storeProfile(d: Pick<z.infer<typeof OnboardSchema>, 'tagline' | 'about' | 'contact' | 'socials'>) {
+  const c = d.contact ?? {}
+  const socials = cleanSocials(d.socials)
+  const profile = Object.fromEntries(
+    Object.entries({
+      tagline: d.tagline,
+      about: d.about,
+      phone: c.phone,
+      whatsapp: whatsappDigits(c.whatsapp) || undefined,
+      email: c.email,
+      address: c.address,
+      city: c.city,
+      state: c.state,
+      pincode: c.pincode,
+    }).filter(([, v]) => !!v)
+  ) as Record<string, string>
+  return Object.keys(socials).length ? { ...profile, socials } : Object.keys(profile).length ? profile : null
+}

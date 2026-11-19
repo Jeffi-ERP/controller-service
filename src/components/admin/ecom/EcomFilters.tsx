@@ -1,0 +1,90 @@
+'use client'
+
+import { useRouter, useSearchParams, usePathname } from 'next/navigation'
+import { useState, useEffect } from 'react'
+import AdminSelect from '@/components/admin/AdminSelect'
+
+// URL-param filter bar for the ecom list pages. Status + plan (AdminSelect dropdowns)
+// + a debounced search box. Writes to the query string; server pages read searchParams.
+// `plans` comes from planSlugs() (the plans table); inactive plans stay listed since stores can still be on them.
+export default function EcomFilters({
+  showPlan = true,
+  statusOptions,
+  plans = [],
+}: {
+  showPlan?: boolean
+  statusOptions?: { value: string; label: string }[]
+  plans?: { slug: string; name: string; active?: boolean }[]
+}) {
+  const router = useRouter()
+  const pathname = usePathname()
+  const params = useSearchParams()
+  const [q, setQ] = useState(params.get('q') || '')
+
+  function setParam(key: string, value: string) {
+    const next = new URLSearchParams(params.toString())
+    if (value) next.set(key, value)
+    else next.delete(key)
+    router.push(`${pathname}?${next.toString()}`)
+  }
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if ((params.get('q') || '') !== q) setParam('q', q)
+    }, 350)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [q])
+
+  const STATUS_OPTS = statusOptions ?? [
+    { value: '', label: 'All statuses' },
+    { value: 'review', label: 'Needs review' },
+    { value: 'pending_approval', label: 'Pending approval' },
+    { value: 'awaiting_payment', label: 'Awaiting payment' },
+    { value: 'active', label: 'Active' },
+    { value: 'provisioning', label: 'Provisioning' },
+    { value: 'suspended', label: 'Suspended' },
+    { value: 'terminated', label: 'Terminated' },
+    { value: 'rejected', label: 'Rejected' },
+  ]
+  const PLAN_OPTS = [
+    { value: '', label: 'All plans' },
+    ...plans.map(p => ({ value: p.slug, label: p.active === false ? `${p.name} (inactive)` : p.name })),
+  ]
+
+  return (
+    <div
+      className={`bg-surface-elevated rounded-lg border border-border-default p-3 sm:p-4 grid grid-cols-2 gap-3 items-end ${
+        showPlan ? 'sm:grid-cols-[minmax(0,200px)_minmax(0,200px)_1fr]' : 'sm:grid-cols-[minmax(0,200px)_1fr]'
+      }`}
+    >
+      <AdminSelect
+        label="Status"
+        value={params.get('status') || ''}
+        options={STATUS_OPTS}
+        onChange={v => setParam('status', v)}
+        sm
+        className={showPlan ? 'min-w-0' : 'min-w-0 col-span-2 sm:col-span-1'}
+      />
+      {showPlan && (
+        <AdminSelect
+          label="Plan"
+          value={params.get('plan') || ''}
+          options={PLAN_OPTS}
+          onChange={v => setParam('plan', v)}
+          sm
+          className="min-w-0"
+        />
+      )}
+      <div className="col-span-2 sm:col-span-1 min-w-0">
+        <label className="block text-xs font-medium text-foreground-muted mb-1 uppercase tracking-wide">Search</label>
+        <input
+          className="w-full rounded-lg border border-border-default bg-surface-elevated px-3 h-control text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent-500"
+          placeholder="Search store name or subdomain…"
+          value={q}
+          onChange={e => setQ(e.target.value)}
+        />
+      </div>
+    </div>
+  )
+}

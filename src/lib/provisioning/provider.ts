@@ -1,0 +1,135 @@
+// Provisioning AWS provider — the seam between the state machine and real AWS.
+//
+// The state machine (steps.ts) only ever calls this interface, so we can:
+//   1. run the full flow locally with StubProvisioningProvider (no real infra)
+//   2. later swap in the real @aws-sdk implementation ONE method at a time,
+//      each verified against a real test RDS before enabling the next.
+//
+// Every method must be IDEMPOTENT and safe to retry (the worker re-runs steps
+// after crashes) — treat "already exists / already owned" as success.
+
+import type { DbAuth } from './tenant-admin-pool'
+
+export interface CreateDbInstanceArgs {
+  dbInstanceId: string // jeffi-tenant-{slug}
+  paramGroup: string
+  maxConnections: number
+  instanceClass?: string // default TENANT_RDS_CLASS (db.t4g.micro)
+  storageGb?: number // default 20
+  multiAz?: boolean
+}
+
+export interface DbInstanceState {
+  status: string // available, modifying, rebooting, …
+  instanceClass: string
+  storageGb: number
+  multiAz: boolean
+  /** Class, storage or standby changes queued for the maintenance window. */
+  pending: boolean
+}
+
+export interface ModifyDbInstanceArgs {
+  instanceClass?: string
+  storageGb?: number
+  multiAz?: boolean
+  /** false queues the change for the maintenance window; true applies it (and anything queued) now. */
+  applyImmediately: boolean
+}
+
+export interface AppInstanceArgs {
+  name: string // jeffi-tenant-{slug} / jeffi-pool
+  instanceType: string
+  userData?: string
+}
+
+export interface ProvisioningProvider {
+  /** Create (or confirm) a custom parameter group with the given max_connections. */
+  ensureParamGroup(paramGroup: string, maxConnections: number): Promise<void>
+
+  /** Create the RDS instance (idempotent). Returns immediately; not yet available. */
+  createDbInstance(args: CreateDbInstanceArgs): Promise<{ dbInstanceId: string; instanceClass?: string }>
+
+  /** The instance's current shape and whether changes are still pending; null when it does not exist. */
+  describeDbInstance(dbInstanceId: string): Promise<DbInstanceState | null>
+
+  /** Change class / storage / Multi-AZ of a running instance. */
+  modifyDbInstance(dbInstanceId: string, args: ModifyDbInstanceArgs): Promise<void>
+
+  /** Poll: is the instance 'available' yet? Returns endpoint when ready, null while pending. */
+  getDbEndpoint(dbInstanceId: string): Promise<string | null>
+
+  /** Run the full desired-state schema + create the app login (app_user, or a Starter store's own role) WITH rds_iam.
+   * An on-node Postgres (db.auth, or an endpoint that is one) has no app login: the store connects as `jeffi`. */
+  loadSchema(endpoint: string, dbName: string, appUser?: string, db?: DbAuth): Promise<void>
+
+  /** Lock a shared Starter host down so no store can connect to its own default databases (idempotent). */
+  initSharedDbHost(endpoint: string): Promise<void>
+
+  /** A Starter store's own database + IAM login role on a shared host, connectable by that role only (idempotent). */
+  createTenantDatabase(endpoint: string, dbName: string, role: string): Promise<void>
+
+  /** Drop a Starter store's database + role from its shared host (idempotent). */
+  dropTenantDatabase(endpoint: string, dbName: string, role: string | null): Promise<void>
+
+  /** Snapshot the tenant DB to a gzip'd archive (pure-JS, no pg_dump binary). */
+  backupDb(endpoint: string, dbName: string, db?: DbAuth): Promise<Buffer>
+
+  /** Restore a gzip'd archive into a fresh (schema-loaded) tenant DB. */
+  restoreDb(endpoint: string, dbName: string, archive: Buffer, db?: DbAuth): Promise<void>
+
+  /** Create + lock down the tenant bucket (public-access-block on; writes to app IAM only). */
+  ensureBucket(bucket: string): Promise<void>
+
+  /** Copy every object of a store's bucket under `destPrefix` in the platform bucket (deprovision keeping
+   * the media files). A bucket that does not exist counts as empty. */
+  archiveBucket(bucket: string, destPrefix: string): Promise<{ objects: number; bytes: number }>
+
+  /** Copy the objects kept under `srcPrefix` in the platform bucket back into a store's bucket. */
+  restoreBucket(srcPrefix: string, bucket: string): Promise<{ objects: number }>
+
+  /** The store's own site_settings (key → value), read before its database is deleted. */
+  readSiteSettings(endpoint: string, dbName: string, db?: DbAuth): Promise<Record<string, string>>
+
+  /** Point the tenant's subdomains at the given target IP (Route53 A-records; idempotent).
+   * targetIp is the tenant's serving host — a dedicated instance IP or the shared pool IP;
+   * omitted falls back to TENANT_APP_TARGET_IP. */
+  ensureDns(hostnames: string[], targetIp?: string): Promise<void>
+
+  /** Remove the tenant's subdomain A-records on deprovision (idempotent, value-agnostic). */
+  removeDns(hostnames: string[]): Promise<void>
+
+  /** Stop the RDS instance (cost saving — test tenant only). */
+  stopDbInstance(dbInstanceId: string): Promise<void>
+
+  /** Start a stopped RDS instance. */
+  startDbInstance(dbInstanceId: string): Promise<void>
+
+  /** Rollback: delete resources created by a failed provision (no leaked billing). */
+  deleteDbInstance(dbInstanceId: string): Promise<void>
+  deleteBucket(bucket: string): Promise<void>
+
+  /** True once the RDS instance no longer exists (teardown ordering before param-group delete). */
+  isDbInstanceGone(dbInstanceId: string): Promise<boolean>
+
+  /** Delete the tenant's custom parameter group (idempotent; NotFound = success). Only
+   * succeeds once no instance references it, so callers must delete the DB first. */
+  deleteParamGroup(paramGroup: string): Promise<void>
+
+  /** Launch an app-serving EC2 (dedicated tenant instance or the shared pool), wait until it
+   * has a public IP, and return it. Idempotent-friendly: caller tracks the instance id. */
+  /**
+   * Launch an app instance. `onLaunched` fires with the new id BEFORE the readiness wait, so
+   * the caller can persist it — an id that only exists on the call stack becomes an orphaned,
+   * billing instance the moment anything after the launch throws.
+   */
+  ensureAppInstance(
+    args: AppInstanceArgs,
+    onLaunched?: (instanceId: string) => Promise<void>
+  ): Promise<{ instanceId: string; ip: string }>
+
+  /** Terminate an app instance (dedicated-tenant teardown / pool delete). Idempotent. */
+  deleteAppInstance(instanceId: string): Promise<void>
+
+  /** True once the instance no longer exists (teardown ordering). */
+  isInstanceGone(instanceId: string): Promise<boolean>
+}
